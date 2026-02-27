@@ -1,12 +1,12 @@
 """
-Sentinel-Shield — AI Security Proxy (Phase 1: Gateway Core)
+Sentinel-Shield — AI Security Proxy (Phase 2: Data Sanitizer)
 
 A lightweight FastAPI proxy that intercepts OpenAI-format chat completion
-requests, redacts sensitive data (emails), logs the event, and returns
-a simulated response.
+requests, redacts PII and secrets via a multi-pattern redaction engine
+(regex + optional spaCy NER), logs the event, and returns a simulated
+response with redaction metadata.
 """
 
-import re
 import uuid
 import time
 import logging
@@ -15,6 +15,8 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from redactor import RedactionEngine, Finding
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -31,50 +33,18 @@ logger = logging.getLogger("sentinel-shield")
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Sentinel-Shield",
-    version="0.1.0",
+    version="0.2.0",
     description="AI Security Proxy — intercept, redact, and audit LLM traffic.",
 )
 
 # ---------------------------------------------------------------------------
-# Redaction engine (Phase 1: email only)
+# Redaction engine (Phase 2: full PII + NER)
 # ---------------------------------------------------------------------------
-EMAIL_PATTERN = re.compile(
-    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
-)
-
-REDACTION_PLACEHOLDER = "[EMAIL_REDACTED]"
-
-
-def redact_emails(text: str) -> tuple[str, int]:
-    """Replace all email addresses in *text* with a placeholder.
-
-    Returns the sanitised text and the count of redactions made.
-    """
-    sanitised, count = EMAIL_PATTERN.subn(REDACTION_PLACEHOLDER, text)
-    return sanitised, count
-
-
-def redact_message_content(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """Walk the messages array and redact emails from every content field.
-
-    Returns the cleaned messages list and total redaction count.
-    """
-    total_redactions = 0
-    sanitised_messages: list[dict[str, Any]] = []
-
-    for msg in messages:
-        new_msg = dict(msg)
-        content = new_msg.get("content", "")
-        if isinstance(content, str):
-            new_msg["content"], count = redact_emails(content)
-            total_redactions += count
-        sanitised_messages.append(new_msg)
-
-    return sanitised_messages, total_redactions
+engine = RedactionEngine()
 
 
 # ---------------------------------------------------------------------------
-# Audit log (in-memory for Phase 1; SQLite in Phase 4)
+# Audit log (in-memory for Phase 1–3; SQLite in Phase 4)
 # ---------------------------------------------------------------------------
 audit_log: list[dict[str, Any]] = []
 
@@ -84,14 +54,17 @@ def record_audit_event(
     redactions: int,
     blocked: bool,
     detail: str,
+    redaction_summary: dict[str, int] | None = None,
 ) -> None:
-    entry = {
+    entry: dict[str, Any] = {
         "request_id": request_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "redactions": redactions,
         "blocked": blocked,
         "detail": detail,
     }
+    if redaction_summary:
+        entry["redaction_summary"] = redaction_summary
     audit_log.append(entry)
     logger.info("AUDIT | %s", entry)
 
@@ -109,13 +82,12 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
     """Intercept an OpenAI-format chat completion request.
 
     1. Parse and log the incoming body.
-    2. Redact emails from all message content.
+    2. Redact PII/secrets from all message content.
     3. Return a simulated completion response with redaction metadata.
     """
     request_id = str(uuid.uuid4())
     body: dict[str, Any] = await request.json()
 
-    # --- log raw request (excluding sensitive headers) ---
     logger.info(
         "INCOMING | id=%s model=%s messages=%d",
         request_id,
@@ -125,21 +97,41 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
 
     # --- redact ---
     messages = body.get("messages", [])
-    sanitised_messages, redaction_count = redact_message_content(messages)
+    sanitised_messages, findings = engine.redact_messages(messages)
+
+    redaction_count = sum(f.count for f in findings)
+    redaction_summary: dict[str, int] = {f.entity_type: f.count for f in findings}
 
     if redaction_count > 0:
         logger.warning(
-            "REDACTED | id=%s count=%d", request_id, redaction_count
+            "REDACTED | id=%s count=%d types=%s",
+            request_id,
+            redaction_count,
+            list(redaction_summary.keys()),
         )
         record_audit_event(
             request_id=request_id,
             redactions=redaction_count,
             blocked=False,
-            detail=f"Redacted {redaction_count} email(s) from prompt",
+            detail=f"Redacted {redaction_count} item(s) from prompt",
+            redaction_summary=redaction_summary,
         )
 
-    # --- simulate LLM response ---
-    # In Phase 2+ this will forward the sanitised payload to the real LLM.
+    # --- build a human-readable summary for the simulated assistant message ---
+    if findings:
+        types_found = ", ".join(sorted(redaction_summary.keys()))
+        assistant_note = (
+            f"[Sentinel-Shield] Request intercepted. "
+            f"{redaction_count} item(s) redacted ({types_found}). "
+            "Forwarding to upstream LLM is not yet enabled."
+        )
+    else:
+        assistant_note = (
+            "[Sentinel-Shield] Request intercepted. "
+            "No sensitive data detected. "
+            "Forwarding to upstream LLM is not yet enabled."
+        )
+
     simulated_response = {
         "id": f"chatcmpl-{request_id[:8]}",
         "object": "chat.completion",
@@ -150,11 +142,7 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": (
-                        "[Sentinel-Shield] Request intercepted. "
-                        f"{redaction_count} email(s) redacted. "
-                        "Forwarding to upstream LLM is not yet enabled."
-                    ),
+                    "content": assistant_note,
                 },
                 "finish_reason": "stop",
             }
@@ -163,6 +151,7 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
         "_sentinel": {
             "request_id": request_id,
             "redactions": redaction_count,
+            "redaction_summary": redaction_summary,
             "blocked": False,
         },
     }
@@ -172,5 +161,5 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
 
 @app.get("/v1/audit")
 async def get_audit_log() -> list[dict[str, Any]]:
-    """Return the in-memory audit trail (Phase 1 convenience endpoint)."""
+    """Return the in-memory audit trail."""
     return audit_log
