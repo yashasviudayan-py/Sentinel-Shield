@@ -32,21 +32,21 @@ CREATE TABLE IF NOT EXISTS audit_events (
     blocked           INTEGER NOT NULL DEFAULT 0,
     detail            TEXT    NOT NULL DEFAULT '',
     redaction_summary TEXT,
-    threats           TEXT
+    threats           TEXT,
+    response          TEXT
 );
 """
 
 _INSERT = """
 INSERT INTO audit_events
-    (request_id, timestamp, redactions, blocked, detail, redaction_summary, threats)
+    (request_id, timestamp, redactions, blocked, detail, redaction_summary, threats, response)
 VALUES
-    (:request_id, :timestamp, :redactions, :blocked, :detail, :redaction_summary, :threats);
+    (:request_id, :timestamp, :redactions, :blocked, :detail, :redaction_summary, :threats, :response);
 """
 
-_SELECT_ALL = """
-SELECT id, request_id, timestamp, redactions, blocked, detail, redaction_summary, threats
+_SELECT_BASE = """
+SELECT id, request_id, timestamp, redactions, blocked, detail, redaction_summary, threats, response
 FROM   audit_events
-ORDER  BY id ASC;
 """
 
 
@@ -69,8 +69,19 @@ class AuditDB:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute(_CREATE_TABLE)
         self._conn.commit()
+        self._migrate()
         display = path if path == ":memory:" else os.path.abspath(path)
         logger.info("AuditDB ready: %s", display)
+
+    def _migrate(self) -> None:
+        """Apply additive schema migrations for existing databases."""
+        for col, definition in [("response", "TEXT")]:
+            try:
+                self._conn.execute(f"ALTER TABLE audit_events ADD COLUMN {col} {definition};")
+                self._conn.commit()
+                logger.info("DB migration: added column '%s'", col)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
     # ------------------------------------------------------------------
     # Write
@@ -94,6 +105,11 @@ class AuditDB:
                 if entry.get("threats")
                 else None
             ),
+            "response": (
+                json.dumps(entry["response"])
+                if entry.get("response")
+                else None
+            ),
         }
         with self._lock:
             self._conn.execute(_INSERT, row)
@@ -103,10 +119,41 @@ class AuditDB:
     # Read
     # ------------------------------------------------------------------
 
-    def get_all(self) -> list[dict[str, Any]]:
-        """Return all audit events in insertion order."""
+    def get_all(
+        self,
+        limit: int | None = None,
+        offset: int = 0,
+        blocked: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return audit events with optional filtering and pagination.
+
+        Args:
+            limit:   Maximum number of rows to return (None = unlimited).
+            offset:  Number of rows to skip from the start.
+            blocked: If True/False, filter by blocked status; None returns all.
+        """
+        query = _SELECT_BASE
+        params: list[Any] = []
+
+        if blocked is not None:
+            query += " WHERE blocked = ?"
+            params.append(int(blocked))
+
+        query += " ORDER BY id ASC"
+
+        # SQLite requires LIMIT when OFFSET is used; -1 means unlimited.
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        elif offset:
+            query += " LIMIT -1"
+
+        if offset:
+            query += " OFFSET ?"
+            params.append(offset)
+
         with self._lock:
-            rows = self._conn.execute(_SELECT_ALL).fetchall()
+            rows = self._conn.execute(query, params).fetchall()
 
         result: list[dict[str, Any]] = []
         for row in rows:
@@ -122,6 +169,8 @@ class AuditDB:
                 event["redaction_summary"] = json.loads(row["redaction_summary"])
             if row["threats"]:
                 event["threats"] = json.loads(row["threats"])
+            if row["response"]:
+                event["response"] = json.loads(row["response"])
             result.append(event)
         return result
 
