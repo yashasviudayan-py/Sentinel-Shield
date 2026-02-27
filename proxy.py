@@ -1,10 +1,10 @@
 """
-Sentinel-Shield — AI Security Proxy (Phase 2: Data Sanitizer)
+Sentinel-Shield — AI Security Proxy (Phase 3: Security Guard)
 
 A lightweight FastAPI proxy that intercepts OpenAI-format chat completion
-requests, redacts PII and secrets via a multi-pattern redaction engine
-(regex + optional spaCy NER), logs the event, and returns a simulated
-response with redaction metadata.
+requests, redacts PII and secrets, then runs jailbreak/prompt-injection
+detection. HIGH-severity threats are blocked with HTTP 403. All events are
+recorded in an in-memory audit log with full threat metadata.
 """
 
 import uuid
@@ -17,6 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from redactor import RedactionEngine, Finding
+from guard import PromptGuard, GuardResult, Threat
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -33,14 +34,15 @@ logger = logging.getLogger("sentinel-shield")
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Sentinel-Shield",
-    version="0.2.0",
-    description="AI Security Proxy — intercept, redact, and audit LLM traffic.",
+    version="0.3.0",
+    description="AI Security Proxy — intercept, redact, guard, and audit LLM traffic.",
 )
 
 # ---------------------------------------------------------------------------
-# Redaction engine (Phase 2: full PII + NER)
+# Engines
 # ---------------------------------------------------------------------------
 engine = RedactionEngine()
+guard = PromptGuard()
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +57,7 @@ def record_audit_event(
     blocked: bool,
     detail: str,
     redaction_summary: dict[str, int] | None = None,
+    threats: list[dict] | None = None,
 ) -> None:
     entry: dict[str, Any] = {
         "request_id": request_id,
@@ -65,8 +68,33 @@ def record_audit_event(
     }
     if redaction_summary:
         entry["redaction_summary"] = redaction_summary
+    if threats is not None:
+        entry["threats"] = threats
     audit_log.append(entry)
     logger.info("AUDIT | %s", entry)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _serialise_threats(threats: list[Threat], *, include_matched_text: bool) -> list[dict]:
+    """Serialise Threat dataclasses to dicts.
+
+    matched_text is included only when writing to the audit log (never echoed
+    in HTTP responses to avoid reflecting adversarial content back to callers).
+    """
+    result = []
+    for t in threats:
+        entry: dict[str, Any] = {
+            "category": t.category,
+            "rule_name": t.rule_name,
+            "severity": t.severity,
+        }
+        if include_matched_text:
+            entry["matched_text"] = t.matched_text
+        result.append(entry)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +109,7 @@ async def health() -> dict[str, str]:
 async def proxy_chat_completions(request: Request) -> JSONResponse:
     """Intercept an OpenAI-format chat completion request.
 
-    1. Parse and log the incoming body.
-    2. Redact PII/secrets from all message content.
-    3. Return a simulated completion response with redaction metadata.
+    Pipeline: Parse → Redact → Guard → [HTTP 403 if blocked] → Audit → HTTP 200
     """
     request_id = str(uuid.uuid4())
     body: dict[str, Any] = await request.json()
@@ -95,7 +121,7 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
         len(body.get("messages", [])),
     )
 
-    # --- redact ---
+    # --- 1. Redact ---
     messages = body.get("messages", [])
     sanitised_messages, findings = engine.redact_messages(messages)
 
@@ -109,15 +135,63 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
             redaction_count,
             list(redaction_summary.keys()),
         )
+
+    # --- 2. Guard (runs on sanitised messages) ---
+    guard_result: GuardResult = guard.inspect_messages(sanitised_messages)
+
+    threats_for_audit = _serialise_threats(guard_result.threats, include_matched_text=True)
+    threats_for_response = _serialise_threats(guard_result.threats, include_matched_text=False)
+
+    if guard_result.blocked:
+        logger.warning(
+            "BLOCKED | id=%s reason=%r threats=%d",
+            request_id,
+            guard_result.reason,
+            len(guard_result.threats),
+        )
         record_audit_event(
             request_id=request_id,
             redactions=redaction_count,
-            blocked=False,
-            detail=f"Redacted {redaction_count} item(s) from prompt",
-            redaction_summary=redaction_summary,
+            blocked=True,
+            detail=guard_result.reason,
+            redaction_summary=redaction_summary or None,
+            threats=threats_for_audit,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "type": "request_blocked",
+                    "message": guard_result.reason,
+                    "code": "policy_violation",
+                },
+                "_sentinel": {
+                    "request_id": request_id,
+                    "blocked": True,
+                    "guard": {
+                        "blocked": True,
+                        "threats": threats_for_response,
+                        "reason": guard_result.reason,
+                    },
+                },
+            },
         )
 
-    # --- build a human-readable summary for the simulated assistant message ---
+    # --- 3. Audit (pass-through) ---
+    record_audit_event(
+        request_id=request_id,
+        redactions=redaction_count,
+        blocked=False,
+        detail=(
+            f"Redacted {redaction_count} item(s) from prompt"
+            if redaction_count > 0
+            else "No sensitive data detected"
+        ),
+        redaction_summary=redaction_summary or None,
+        threats=threats_for_audit if threats_for_audit else None,
+    )
+
+    # --- 4. Build simulated response ---
     if findings:
         types_found = ", ".join(sorted(redaction_summary.keys()))
         assistant_note = (
@@ -153,6 +227,11 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
             "redactions": redaction_count,
             "redaction_summary": redaction_summary,
             "blocked": False,
+            "guard": {
+                "blocked": False,
+                "threats": threats_for_response,
+                "reason": guard_result.reason,
+            },
         },
     }
 
