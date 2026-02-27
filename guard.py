@@ -54,7 +54,7 @@ _RULES: list[tuple[str, str, re.Pattern, str]] = [
     (
         "PROMPT_INJECTION",
         "override_system",
-        re.compile(r"override (your )?system prompt", re.IGNORECASE),
+        re.compile(r"override (?:your |the )?system prompt", re.IGNORECASE),
         "HIGH",
     ),
     # --- JAILBREAK_ROLEPLAY ---

@@ -69,7 +69,8 @@ class AuditDB:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute(_CREATE_TABLE)
         self._conn.commit()
-        logger.info("AuditDB ready: %s", os.path.abspath(path))
+        display = path if path == ":memory:" else os.path.abspath(path)
+        logger.info("AuditDB ready: %s", display)
 
     # ------------------------------------------------------------------
     # Write
