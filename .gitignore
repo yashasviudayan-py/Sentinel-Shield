@@ -37,3 +37,8 @@ htmlcov/
 # Distribution
 *.tar.gz
 *.whl
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal

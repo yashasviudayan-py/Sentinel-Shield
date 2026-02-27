@@ -1,15 +1,19 @@
 """
-Sentinel-Shield — AI Security Proxy (Phase 3: Security Guard)
+Sentinel-Shield — AI Security Proxy (Phase 4: SQLite Audit Persistence)
 
 A lightweight FastAPI proxy that intercepts OpenAI-format chat completion
-requests, redacts PII and secrets, then runs jailbreak/prompt-injection
-detection. HIGH-severity threats are blocked with HTTP 403. All events are
-recorded in an in-memory audit log with full threat metadata.
+requests, redacts PII and secrets, runs jailbreak/prompt-injection detection,
+and persists every audit event to a SQLite database.
+
+Environment variables:
+  SENTINEL_DB_PATH   Path to the SQLite database file (default: sentinel_audit.db)
 """
 
+import os
 import uuid
 import time
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,6 +22,7 @@ from fastapi.responses import JSONResponse
 
 from redactor import RedactionEngine, Finding
 from guard import PromptGuard, GuardResult, Threat
+from db import AuditDB
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -30,12 +35,28 @@ logging.basicConfig(
 logger = logging.getLogger("sentinel-shield")
 
 # ---------------------------------------------------------------------------
+# Lifespan (open / close DB around app lifetime)
+# ---------------------------------------------------------------------------
+_db: AuditDB | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _db
+    db_path = os.getenv("SENTINEL_DB_PATH", "sentinel_audit.db")
+    _db = AuditDB(path=db_path)
+    yield
+    _db.close()
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Sentinel-Shield",
-    version="0.3.0",
-    description="AI Security Proxy — intercept, redact, guard, and audit LLM traffic.",
+    version="0.4.0",
+    description="AI Security Proxy — intercept, redact, guard, and persist LLM traffic.",
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
@@ -46,10 +67,8 @@ guard = PromptGuard()
 
 
 # ---------------------------------------------------------------------------
-# Audit log (in-memory for Phase 1–3; SQLite in Phase 4)
+# Audit helpers
 # ---------------------------------------------------------------------------
-audit_log: list[dict[str, Any]] = []
-
 
 def record_audit_event(
     request_id: str,
@@ -70,13 +89,11 @@ def record_audit_event(
         entry["redaction_summary"] = redaction_summary
     if threats is not None:
         entry["threats"] = threats
-    audit_log.append(entry)
+
+    assert _db is not None, "AuditDB not initialised"
+    _db.insert(entry)
     logger.info("AUDIT | %s", entry)
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _serialise_threats(threats: list[Threat], *, include_matched_text: bool) -> list[dict]:
     """Serialise Threat dataclasses to dicts.
@@ -86,20 +103,21 @@ def _serialise_threats(threats: list[Threat], *, include_matched_text: bool) -> 
     """
     result = []
     for t in threats:
-        entry: dict[str, Any] = {
+        item: dict[str, Any] = {
             "category": t.category,
             "rule_name": t.rule_name,
             "severity": t.severity,
         }
         if include_matched_text:
-            entry["matched_text"] = t.matched_text
-        result.append(entry)
+            item["matched_text"] = t.matched_text
+        result.append(item)
     return result
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "sentinel-shield"}
@@ -240,5 +258,6 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
 
 @app.get("/v1/audit")
 async def get_audit_log() -> list[dict[str, Any]]:
-    """Return the in-memory audit trail."""
-    return audit_log
+    """Return the full audit trail from SQLite."""
+    assert _db is not None, "AuditDB not initialised"
+    return _db.get_all()
