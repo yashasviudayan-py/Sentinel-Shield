@@ -1,5 +1,5 @@
 """
-Sentinel-Shield — AI Security Proxy (v0.6.0)
+Sentinel-Shield — AI Security Proxy (v0.7.0)
 
 Pipeline per request:
   Parse → Redact → Guard → [HTTP 403 if blocked]
@@ -7,16 +7,23 @@ Pipeline per request:
       → Scan response (redact PII + guard)
       → Audit → HTTP 200
 
+Streaming pipeline (stream=true):
+  Parse → Redact → Guard → [HTTP 403 if blocked]
+      → Collect upstream SSE → Scan assembled response
+      → Re-emit sanitized SSE → Audit
+
 Environment variables:
   SENTINEL_DB_PATH       SQLite file path          (default: sentinel_audit.db)
   SENTINEL_API_KEY       Bearer token for /v1/*    (auth disabled if unset)
   SENTINEL_UPSTREAM_URL  OpenAI-compatible LLM URL (e.g. http://localhost:11434/v1)
   SENTINEL_RATE_LIMIT    slowapi limit string       (default: 60/minute)
+  SENTINEL_WEBHOOK_URL   Alert webhook URL          (disabled if unset)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import time
@@ -28,8 +35,9 @@ from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -47,6 +55,33 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger("sentinel-shield")
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+_requests_total = Counter(
+    "sentinel_requests_total",
+    "Total proxy requests processed",
+    ["blocked", "streamed"],
+)
+_redactions_total = Counter(
+    "sentinel_redactions_total",
+    "Total entity redactions by type",
+    ["entity_type"],
+)
+_threats_total = Counter(
+    "sentinel_threats_total",
+    "Total threats detected by category and severity",
+    ["category", "severity"],
+)
+_request_duration = Histogram(
+    "sentinel_request_duration_seconds",
+    "End-to-end request processing time in seconds",
+)
+_upstream_errors_total = Counter(
+    "sentinel_upstream_errors_total",
+    "Total upstream LLM errors",
+)
 
 # ---------------------------------------------------------------------------
 # Rate limiter (must be created before app)
@@ -92,7 +127,7 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Sentinel-Shield",
-    version="0.6.0",
+    version="0.7.0",
     description="AI Security Proxy — redact, guard, rate-limit, and forward LLM traffic.",
     lifespan=lifespan,
 )
@@ -178,6 +213,43 @@ def _serialise_threats(threats: list[Threat], *, include_matched_text: bool) -> 
 
 
 # ---------------------------------------------------------------------------
+# Webhook
+# ---------------------------------------------------------------------------
+
+# Strong references to in-flight webhook tasks so they aren't garbage-collected
+# before completion.  The done callback removes each task from the set.
+_webhook_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_webhook(payload: dict[str, Any]) -> None:
+    """Schedule _fire_webhook as a fire-and-forget background task."""
+    task = asyncio.create_task(_fire_webhook(payload))
+    _webhook_tasks.add(task)
+    task.add_done_callback(_webhook_tasks.discard)
+
+
+async def _fire_webhook(payload: dict[str, Any]) -> None:
+    """POST a JSON alert payload to SENTINEL_WEBHOOK_URL.
+
+    Silently swallows all errors so a broken webhook never blocks a response.
+    matched_text is never included in webhook payloads.
+    """
+    url = os.getenv("SENTINEL_WEBHOOK_URL", "")
+    if not url:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http_client:
+            await http_client.post(url, json=payload)
+        logger.info(
+            "WEBHOOK_SENT | event=%s request_id=%s",
+            payload.get("event"),
+            payload.get("request_id"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("WEBHOOK_ERROR | %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Response scanning
 # ---------------------------------------------------------------------------
 
@@ -246,7 +318,7 @@ def _scan_upstream_response(
 
 
 # ---------------------------------------------------------------------------
-# Upstream forwarding
+# Upstream forwarding — non-streaming
 # ---------------------------------------------------------------------------
 
 async def _forward_to_upstream(body: dict[str, Any], upstream_url: str) -> dict[str, Any]:
@@ -259,6 +331,135 @@ async def _forward_to_upstream(body: dict[str, Any], upstream_url: str) -> dict[
 
 
 # ---------------------------------------------------------------------------
+# Upstream forwarding — streaming
+# ---------------------------------------------------------------------------
+
+async def _collect_and_scan_stream(
+    body: dict[str, Any],
+    upstream_url: str,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Stream from upstream LLM, buffer all SSE chunks, scan, return sanitized content.
+
+    Buffers the entire response before scanning so the guard and redaction
+    engines always operate on complete text. This adds latency proportional
+    to the upstream response time but is necessary for correct security checks.
+
+    Returns:
+        (sanitized_content, first_chunk_meta, response_meta)
+
+    Raises:
+        httpx.HTTPError on upstream failure.
+    """
+    url = upstream_url.rstrip("/") + "/chat/completions"
+    full_content = ""
+    first_chunk: dict[str, Any] = {}
+
+    async with httpx.AsyncClient(timeout=60.0) as http_client:
+        async with http_client.stream("POST", url, json=body) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if not first_chunk:
+                    first_chunk = chunk
+                delta_content = (
+                    chunk.get("choices", [{}])[0]
+                    .get("delta", {})
+                    .get("content") or ""
+                )
+                full_content += delta_content
+
+    # Build a complete response object so _scan_upstream_response can operate normally
+    full_resp: dict[str, Any] = {
+        "id": first_chunk.get("id", ""),
+        "object": "chat.completion",
+        "created": first_chunk.get("created", int(time.time())),
+        "model": first_chunk.get("model", ""),
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": full_content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    full_resp, response_meta = _scan_upstream_response(full_resp)
+    sanitized_content = full_resp["choices"][0]["message"]["content"]
+    return sanitized_content, first_chunk, response_meta
+
+
+# ---------------------------------------------------------------------------
+# SSE response builder
+# ---------------------------------------------------------------------------
+
+def _build_sse_response(
+    content: str,
+    sentinel_meta: dict[str, Any],
+    comp_id: str,
+    created: int,
+    model: str,
+) -> StreamingResponse:
+    """Return a StreamingResponse emitting OpenAI-compatible SSE chunks.
+
+    Emits three chunks:
+      1. role-announcing delta (role: "assistant", content: "")
+      2. content delta with the full sanitized text
+      3. finish chunk (finish_reason: "stop") carrying _sentinel metadata
+    Followed by data: [DONE].
+    """
+    def _generate():
+        role_chunk = {
+            "id": comp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}
+            ],
+        }
+        yield f"data: {json.dumps(role_chunk)}\n\n"
+
+        content_chunk = {
+            "id": comp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {"index": 0, "delta": {"content": content}, "finish_reason": None}
+            ],
+        }
+        yield f"data: {json.dumps(content_chunk)}\n\n"
+
+        finish_chunk = {
+            "id": comp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "_sentinel": sentinel_meta,
+        }
+        yield f"data: {json.dumps(finish_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Sentinel-Request-ID": sentinel_meta["request_id"],
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -267,22 +468,31 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "sentinel-shield"}
 
 
+@app.get("/metrics", include_in_schema=False)
+async def metrics() -> Response:
+    """Prometheus metrics scrape endpoint."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/v1/chat/completions", dependencies=[Depends(_verify_api_key)])
 @limiter.limit(_rate_limit)
-async def proxy_chat_completions(request: Request) -> JSONResponse:
+async def proxy_chat_completions(request: Request) -> Response:
     """Intercept an OpenAI-format chat completion request.
 
     Pipeline: Parse → Redact → Guard → [403 if blocked]
-              → Upstream/Simulated → Scan response → Audit → 200
+              → Upstream/Simulated → Scan response → Audit → 200/SSE
     """
     request_id = str(uuid.uuid4())
+    t_start = time.monotonic()
     body: dict[str, Any] = await request.json()
+    is_streaming = bool(body.get("stream"))
 
     logger.info(
-        "INCOMING | id=%s model=%s messages=%d",
+        "INCOMING | id=%s model=%s messages=%d stream=%s",
         request_id,
         body.get("model", "unknown"),
         len(body.get("messages", [])),
+        is_streaming,
     )
 
     # --- 1. Redact ---
@@ -299,12 +509,17 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
             redaction_count,
             list(redaction_summary.keys()),
         )
+        for entity_type, count in redaction_summary.items():
+            _redactions_total.labels(entity_type=entity_type).inc(count)
 
     # --- 2. Guard (runs on sanitised messages) ---
     guard_result: GuardResult = guard.inspect_messages(sanitised_messages)
 
     threats_for_audit = _serialise_threats(guard_result.threats, include_matched_text=True)
     threats_for_response = _serialise_threats(guard_result.threats, include_matched_text=False)
+
+    for t in guard_result.threats:
+        _threats_total.labels(category=t.category, severity=t.severity).inc()
 
     if guard_result.blocked:
         logger.warning(
@@ -321,6 +536,16 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
             redaction_summary=redaction_summary or None,
             threats=threats_for_audit,
         )
+        _schedule_webhook({
+            "event": "request_blocked",
+            "request_id": request_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reason": guard_result.reason,
+            "threats": threats_for_response,
+            "redaction_summary": redaction_summary,
+        })
+        _requests_total.labels(blocked="true", streamed=str(is_streaming).lower()).inc()
+        _request_duration.observe(time.monotonic() - t_start)
         return JSONResponse(
             status_code=403,
             content={
@@ -359,27 +584,79 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
     if upstream_url:
         try:
             upstream_body = {**body, "messages": sanitised_messages}
-            upstream_data = await _forward_to_upstream(upstream_body, upstream_url)
 
-            # --- 5. Scan the upstream response ---
-            upstream_data, response_meta = _scan_upstream_response(upstream_data)
-            sentinel_meta["response"] = response_meta
+            if is_streaming:
+                # --- Streaming path: buffer, scan, re-emit ---
+                sanitized_content, first_chunk, response_meta = (
+                    await _collect_and_scan_stream(upstream_body, upstream_url)
+                )
+                sentinel_meta["response"] = response_meta
 
-            upstream_data["_sentinel"] = sentinel_meta
+                if response_meta.get("blocked"):
+                    _schedule_webhook({
+                        "event": "response_blocked",
+                        "request_id": request_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "reason": response_meta["guard"]["reason"],
+                        "threats": response_meta["guard"]["threats"],
+                    })
 
-            await record_audit_event(
-                request_id=request_id,
-                redactions=redaction_count,
-                blocked=False,
-                detail=f"Forwarded to upstream: {upstream_url}",
-                redaction_summary=redaction_summary or None,
-                threats=threats_for_audit if threats_for_audit else None,
-                response=response_meta,
-            )
-            return JSONResponse(content=upstream_data)
+                await record_audit_event(
+                    request_id=request_id,
+                    redactions=redaction_count,
+                    blocked=False,
+                    detail=f"Streamed from upstream: {upstream_url}",
+                    redaction_summary=redaction_summary or None,
+                    threats=threats_for_audit if threats_for_audit else None,
+                    response=response_meta,
+                )
+                _requests_total.labels(blocked="false", streamed="true").inc()
+                _request_duration.observe(time.monotonic() - t_start)
+                return _build_sse_response(
+                    sanitized_content,
+                    sentinel_meta,
+                    comp_id=first_chunk.get("id", f"chatcmpl-{request_id[:8]}"),
+                    created=first_chunk.get("created", int(time.time())),
+                    model=first_chunk.get("model", body.get("model", "unknown")),
+                )
+
+            else:
+                # --- Non-streaming path ---
+                upstream_data = await _forward_to_upstream(upstream_body, upstream_url)
+
+                # --- 5. Scan the upstream response ---
+                upstream_data, response_meta = _scan_upstream_response(upstream_data)
+                sentinel_meta["response"] = response_meta
+
+                if response_meta.get("blocked"):
+                    _schedule_webhook({
+                        "event": "response_blocked",
+                        "request_id": request_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "reason": response_meta["guard"]["reason"],
+                        "threats": response_meta["guard"]["threats"],
+                    })
+
+                upstream_data["_sentinel"] = sentinel_meta
+
+                await record_audit_event(
+                    request_id=request_id,
+                    redactions=redaction_count,
+                    blocked=False,
+                    detail=f"Forwarded to upstream: {upstream_url}",
+                    redaction_summary=redaction_summary or None,
+                    threats=threats_for_audit if threats_for_audit else None,
+                    response=response_meta,
+                )
+                _requests_total.labels(blocked="false", streamed="false").inc()
+                _request_duration.observe(time.monotonic() - t_start)
+                return JSONResponse(content=upstream_data)
 
         except httpx.HTTPError as exc:
             logger.error("UPSTREAM_ERROR | id=%s %s", request_id, exc)
+            _upstream_errors_total.inc()
+            _requests_total.labels(blocked="false", streamed=str(is_streaming).lower()).inc()
+            _request_duration.observe(time.monotonic() - t_start)
             return JSONResponse(
                 status_code=502,
                 content={
@@ -419,8 +696,21 @@ async def proxy_chat_completions(request: Request) -> JSONResponse:
             "Set SENTINEL_UPSTREAM_URL to forward to a real LLM."
         )
 
+    comp_id = f"chatcmpl-{request_id[:8]}"
+    _requests_total.labels(blocked="false", streamed=str(is_streaming).lower()).inc()
+    _request_duration.observe(time.monotonic() - t_start)
+
+    if is_streaming:
+        return _build_sse_response(
+            assistant_note,
+            sentinel_meta,
+            comp_id=comp_id,
+            created=int(time.time()),
+            model=body.get("model", "gpt-3.5-turbo"),
+        )
+
     return JSONResponse(content={
-        "id": f"chatcmpl-{request_id[:8]}",
+        "id": comp_id,
         "object": "chat.completion",
         "created": int(time.time()),
         "model": body.get("model", "gpt-3.5-turbo"),
