@@ -1,23 +1,26 @@
 """
-Sentinel-Shield — AI Security Proxy (v0.7.0)
+Sentinel-Shield — AI Security Proxy (v0.8.0)
 
 Pipeline per request:
-  Parse → Redact → Guard → [HTTP 403 if blocked]
+  Parse → [413 if too large] → Redact → Guard → [403 if blocked]
       → Forward to upstream LLM (or simulated)
       → Scan response (redact PII + guard)
       → Audit → HTTP 200
 
 Streaming pipeline (stream=true):
-  Parse → Redact → Guard → [HTTP 403 if blocked]
+  Parse → [413 if too large] → Redact → Guard → [403 if blocked]
       → Collect upstream SSE → Scan assembled response
       → Re-emit sanitized SSE → Audit
 
 Environment variables:
-  SENTINEL_DB_PATH       SQLite file path          (default: sentinel_audit.db)
-  SENTINEL_API_KEY       Bearer token for /v1/*    (auth disabled if unset)
-  SENTINEL_UPSTREAM_URL  OpenAI-compatible LLM URL (e.g. http://localhost:11434/v1)
-  SENTINEL_RATE_LIMIT    slowapi limit string       (default: 60/minute)
-  SENTINEL_WEBHOOK_URL   Alert webhook URL          (disabled if unset)
+  SENTINEL_DB_PATH         SQLite file path           (default: sentinel_audit.db)
+  SENTINEL_API_KEY         Bearer token for /v1/*     (auth disabled if unset)
+  SENTINEL_UPSTREAM_URL    OpenAI-compatible LLM URL  (e.g. http://localhost:11434/v1)
+  SENTINEL_RATE_LIMIT      slowapi limit string        (default: 60/minute)
+  SENTINEL_WEBHOOK_URL     Alert webhook URL           (disabled if unset)
+  SENTINEL_MAX_BODY_BYTES  Max request body in bytes   (default: 1048576 = 1 MB)
+  SENTINEL_TRUSTED_ROLES   Comma-separated roles that  (default: system)
+                           skip the guard (still redacted)
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from slowapi.util import get_remote_address
 
 from db import AuditDB
 from guard import GuardResult, PromptGuard, Threat
-from redactor import Finding, RedactionEngine
+from redactor import Finding, RedactionEngine, _ner_available
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -82,6 +85,11 @@ _upstream_errors_total = Counter(
     "sentinel_upstream_errors_total",
     "Total upstream LLM errors",
 )
+
+# ---------------------------------------------------------------------------
+# Request size limit
+# ---------------------------------------------------------------------------
+_MAX_BODY_DEFAULT = 1_048_576  # 1 MB
 
 # ---------------------------------------------------------------------------
 # Rate limiter (must be created before app)
@@ -127,7 +135,7 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Sentinel-Shield",
-    version="0.7.0",
+    version="0.8.0",
     description="AI Security Proxy — redact, guard, rate-limit, and forward LLM traffic.",
     lifespan=lifespan,
 )
@@ -460,12 +468,72 @@ def _build_sse_response(
 
 
 # ---------------------------------------------------------------------------
+# Health-check helpers
+# ---------------------------------------------------------------------------
+
+async def _check_db() -> dict[str, str]:
+    """Verify the AuditDB is open and responding."""
+    if _db is None:
+        return {"status": "error", "detail": "not initialized"}
+    try:
+        await asyncio.to_thread(_db.get_all, limit=1)
+        return {"status": "ok"}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "detail": str(exc)}
+
+
+async def _check_upstream(url: str) -> dict[str, str]:
+    """Ping the upstream base URL; any HTTP response counts as reachable."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as http_client:
+            await http_client.get(url)
+        return {"status": "ok", "url": url}
+    except Exception:  # noqa: BLE001
+        return {"status": "unreachable", "url": url}
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "service": "sentinel-shield"}
+async def health() -> JSONResponse:
+    """Liveness + readiness check.
+
+    Runs DB connectivity, NER model, and optional upstream reachability
+    checks in parallel. Returns 200 when all critical checks pass, 503 if
+    the database is unavailable.
+    """
+    upstream_url = os.getenv("SENTINEL_UPSTREAM_URL", "")
+
+    coros: list = [_check_db()]
+    if upstream_url:
+        coros.append(_check_upstream(upstream_url))
+
+    results = await asyncio.gather(*coros)
+    db_status = results[0]
+    upstream_status = results[1] if upstream_url else {"status": "unconfigured"}
+
+    ner_status = (
+        {"status": "ok", "model": "en_core_web_sm"}
+        if _ner_available
+        else {"status": "unavailable"}
+    )
+
+    overall = "ok" if db_status["status"] == "ok" else "degraded"
+    return JSONResponse(
+        status_code=200 if overall == "ok" else 503,
+        content={
+            "status": overall,
+            "service": "sentinel-shield",
+            "version": "0.8.0",
+            "checks": {
+                "database": db_status,
+                "ner_model": ner_status,
+                "upstream": upstream_status,
+            },
+        },
+    )
 
 
 @app.get("/metrics", include_in_schema=False)
@@ -484,6 +552,26 @@ async def proxy_chat_completions(request: Request) -> Response:
     """
     request_id = str(uuid.uuid4())
     t_start = time.monotonic()
+
+    # --- 0. Size guard ---
+    max_body = int(os.getenv("SENTINEL_MAX_BODY_BYTES", _MAX_BODY_DEFAULT))
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > max_body:
+        return JSONResponse(
+            status_code=413,
+            content={"error": {"type": "request_too_large",
+                               "message": f"Request body exceeds {max_body} bytes",
+                               "code": "request_too_large"}},
+        )
+    raw_body = await request.body()
+    if len(raw_body) > max_body:
+        return JSONResponse(
+            status_code=413,
+            content={"error": {"type": "request_too_large",
+                               "message": f"Request body exceeds {max_body} bytes",
+                               "code": "request_too_large"}},
+        )
+
     body: dict[str, Any] = await request.json()
     is_streaming = bool(body.get("stream"))
 
@@ -512,8 +600,17 @@ async def proxy_chat_completions(request: Request) -> Response:
         for entity_type, count in redaction_summary.items():
             _redactions_total.labels(entity_type=entity_type).inc(count)
 
-    # --- 2. Guard (runs on sanitised messages) ---
-    guard_result: GuardResult = guard.inspect_messages(sanitised_messages)
+    # --- 2. Guard (runs on sanitised messages, skipping trusted roles) ---
+    trusted_roles = {
+        r.strip().lower()
+        for r in os.getenv("SENTINEL_TRUSTED_ROLES", "system").split(",")
+        if r.strip()
+    }
+    messages_for_guard = [
+        m for m in sanitised_messages
+        if m.get("role", "").lower() not in trusted_roles
+    ]
+    guard_result: GuardResult = guard.inspect_messages(messages_for_guard)
 
     threats_for_audit = _serialise_threats(guard_result.threats, include_matched_text=True)
     threats_for_response = _serialise_threats(guard_result.threats, include_matched_text=False)
