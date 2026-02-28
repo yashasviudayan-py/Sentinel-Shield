@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  sentinel:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - sentinel_data:/data
+    environment:
+      # Point to whichever upstream you use — Ollama, OpenAI-compatible, etc.
+      SENTINEL_UPSTREAM_URL: ${SENTINEL_UPSTREAM_URL:-http://ollama:11434/v1}
+      SENTINEL_UPSTREAM_PROVIDER: ${SENTINEL_UPSTREAM_PROVIDER:-openai}
+      SENTINEL_API_KEY: ${SENTINEL_API_KEY:-}
+      SENTINEL_RATE_LIMIT: ${SENTINEL_RATE_LIMIT:-60/minute}
+      SENTINEL_WEBHOOK_URL: ${SENTINEL_WEBHOOK_URL:-}
+      SENTINEL_MAX_BODY_BYTES: ${SENTINEL_MAX_BODY_BYTES:-1048576}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Include Ollama only if you want a fully local stack.
+  # Remove this service if you are using OpenAI / Anthropic cloud.
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  sentinel_data:
+  ollama_data:
