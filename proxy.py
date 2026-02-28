@@ -1,5 +1,5 @@
 """
-Sentinel-Shield — AI Security Proxy (v0.8.0)
+Sentinel-Shield — AI Security Proxy (v0.9.0)
 
 Pipeline per request:
   Parse → [413 if too large] → Redact → Guard → [403 if blocked]
@@ -13,19 +13,25 @@ Streaming pipeline (stream=true):
       → Re-emit sanitized SSE → Audit
 
 Environment variables:
-  SENTINEL_DB_PATH         SQLite file path           (default: sentinel_audit.db)
-  SENTINEL_API_KEY         Bearer token for /v1/*     (auth disabled if unset)
-  SENTINEL_UPSTREAM_URL    OpenAI-compatible LLM URL  (e.g. http://localhost:11434/v1)
-  SENTINEL_RATE_LIMIT      slowapi limit string        (default: 60/minute)
-  SENTINEL_WEBHOOK_URL     Alert webhook URL           (disabled if unset)
-  SENTINEL_MAX_BODY_BYTES  Max request body in bytes   (default: 1048576 = 1 MB)
-  SENTINEL_TRUSTED_ROLES   Comma-separated roles that  (default: system)
-                           skip the guard (still redacted)
+  SENTINEL_DB_PATH              SQLite file path               (default: sentinel_audit.db)
+  SENTINEL_API_KEY              Bearer token for /v1/*         (auth disabled if unset)
+  SENTINEL_UPSTREAM_URL         Upstream LLM base URL          (e.g. http://localhost:11434/v1)
+  SENTINEL_UPSTREAM_PROVIDER    "openai" (default) or "anthropic"
+  ANTHROPIC_API_KEY             Anthropic API key              (required when provider=anthropic)
+  SENTINEL_RATE_LIMIT           slowapi limit string            (default: 60/minute)
+  SENTINEL_WEBHOOK_URL          Alert webhook URL               (disabled if unset)
+  SENTINEL_MAX_BODY_BYTES       Max request body in bytes       (default: 1048576 = 1 MB)
+  SENTINEL_TRUSTED_ROLES        Comma-separated roles that      (default: system)
+                                skip the guard (still redacted)
+  SENTINEL_GUARD_RULES_FILE     Path to JSON file with custom   (disabled if unset)
+                                guard rules appended to built-ins
 """
 
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import os
 import secrets
@@ -135,7 +141,7 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Sentinel-Shield",
-    version="0.8.0",
+    version="0.9.0",
     description="AI Security Proxy — redact, guard, rate-limit, and forward LLM traffic.",
     lifespan=lifespan,
 )
@@ -146,7 +152,7 @@ app.add_exception_handler(RateLimitExceeded, _handle_rate_limit)  # type: ignore
 # Engines
 # ---------------------------------------------------------------------------
 engine = RedactionEngine()
-guard = PromptGuard()
+guard = PromptGuard(rules_file=os.getenv("SENTINEL_GUARD_RULES_FILE") or None)
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -468,6 +474,89 @@ def _build_sse_response(
 
 
 # ---------------------------------------------------------------------------
+# Anthropic adapter
+# ---------------------------------------------------------------------------
+
+def _convert_to_anthropic(body: dict[str, Any]) -> dict[str, Any]:
+    """Convert an OpenAI-format chat request to Anthropic Messages API format.
+
+    - System messages are extracted into the top-level ``system`` field.
+    - Only user/assistant messages are kept in the ``messages`` array.
+    - ``max_tokens`` defaults to 1024 if not supplied by the caller.
+    """
+    messages = body.get("messages", [])
+    system_parts = [
+        m["content"] for m in messages
+        if m.get("role") == "system" and isinstance(m.get("content"), str)
+    ]
+    non_system = [
+        {"role": m["role"], "content": m["content"]}
+        for m in messages
+        if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
+    ]
+    anthropic_body: dict[str, Any] = {
+        "model": body.get("model", "claude-3-5-sonnet-20241022"),
+        "max_tokens": body.get("max_tokens", 1024),
+        "messages": non_system,
+    }
+    if system_parts:
+        anthropic_body["system"] = "\n".join(system_parts)
+    return anthropic_body
+
+
+def _convert_anthropic_to_openai(response: dict[str, Any]) -> dict[str, Any]:
+    """Convert an Anthropic Messages API response to OpenAI chat.completion format."""
+    text = next(
+        (block["text"] for block in response.get("content", []) if block.get("type") == "text"),
+        "",
+    )
+    usage = response.get("usage", {})
+    prompt_tokens = usage.get("input_tokens", 0)
+    completion_tokens = usage.get("output_tokens", 0)
+    return {
+        "id": f"chatcmpl-{response.get('id', '')}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": response.get("model", ""),
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": response.get("stop_reason", "stop"),
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+async def _forward_to_anthropic(
+    body: dict[str, Any],
+    api_key: str,
+    upstream_url: str = "",
+) -> dict[str, Any]:
+    """POST *body* to the Anthropic Messages API and return its JSON response.
+
+    Uses ``upstream_url`` as the base when set (useful for proxies / local
+    stubs); otherwise defaults to ``https://api.anthropic.com/v1``.
+    """
+    base = upstream_url.rstrip("/") if upstream_url else "https://api.anthropic.com/v1"
+    url = base + "/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=60.0) as http_client:
+        response = await http_client.post(url, json=body, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+
+# ---------------------------------------------------------------------------
 # Health-check helpers
 # ---------------------------------------------------------------------------
 
@@ -526,7 +615,7 @@ async def health() -> JSONResponse:
         content={
             "status": overall,
             "service": "sentinel-shield",
-            "version": "0.8.0",
+            "version": "0.9.0",
             "checks": {
                 "database": db_status,
                 "ner_model": ner_status,
@@ -678,14 +767,62 @@ async def proxy_chat_completions(request: Request) -> Response:
 
     # --- 4. Forward to upstream LLM (or fall back to simulated response) ---
     upstream_url = os.getenv("SENTINEL_UPSTREAM_URL", "")
-    if upstream_url:
+    provider = os.getenv("SENTINEL_UPSTREAM_PROVIDER", "openai").lower()
+    # For the Anthropic provider, use the configured URL or fall back to the
+    # public API base when SENTINEL_UPSTREAM_URL is not set.
+    effective_url = upstream_url or ("https://api.anthropic.com/v1" if provider == "anthropic" else "")
+
+    if effective_url:
         try:
             upstream_body = {**body, "messages": sanitised_messages}
 
-            if is_streaming:
-                # --- Streaming path: buffer, scan, re-emit ---
+            if provider == "anthropic":
+                # --- Anthropic path (always non-streaming at API level) ---
+                api_key = os.getenv("ANTHROPIC_API_KEY", "")
+                anthropic_request = _convert_to_anthropic(upstream_body)
+                raw_response = await _forward_to_anthropic(anthropic_request, api_key, effective_url)
+                upstream_data = _convert_anthropic_to_openai(raw_response)
+
+                upstream_data, response_meta = _scan_upstream_response(upstream_data)
+                sentinel_meta["response"] = response_meta
+
+                if response_meta.get("blocked"):
+                    _schedule_webhook({
+                        "event": "response_blocked",
+                        "request_id": request_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "reason": response_meta["guard"]["reason"],
+                        "threats": response_meta["guard"]["threats"],
+                    })
+
+                await record_audit_event(
+                    request_id=request_id,
+                    redactions=redaction_count,
+                    blocked=False,
+                    detail=f"Forwarded to Anthropic: {effective_url}",
+                    redaction_summary=redaction_summary or None,
+                    threats=threats_for_audit if threats_for_audit else None,
+                    response=response_meta,
+                )
+                _requests_total.labels(blocked="false", streamed=str(is_streaming).lower()).inc()
+                _request_duration.observe(time.monotonic() - t_start)
+
+                if is_streaming:
+                    content = upstream_data["choices"][0]["message"]["content"]
+                    return _build_sse_response(
+                        content,
+                        sentinel_meta,
+                        comp_id=upstream_data.get("id", f"chatcmpl-{request_id[:8]}"),
+                        created=upstream_data.get("created", int(time.time())),
+                        model=upstream_data.get("model", body.get("model", "")),
+                    )
+                upstream_data["_sentinel"] = sentinel_meta
+                return JSONResponse(content=upstream_data)
+
+            elif is_streaming:
+                # --- OpenAI streaming path: buffer, scan, re-emit ---
                 sanitized_content, first_chunk, response_meta = (
-                    await _collect_and_scan_stream(upstream_body, upstream_url)
+                    await _collect_and_scan_stream(upstream_body, effective_url)
                 )
                 sentinel_meta["response"] = response_meta
 
@@ -702,7 +839,7 @@ async def proxy_chat_completions(request: Request) -> Response:
                     request_id=request_id,
                     redactions=redaction_count,
                     blocked=False,
-                    detail=f"Streamed from upstream: {upstream_url}",
+                    detail=f"Streamed from upstream: {effective_url}",
                     redaction_summary=redaction_summary or None,
                     threats=threats_for_audit if threats_for_audit else None,
                     response=response_meta,
@@ -718,8 +855,8 @@ async def proxy_chat_completions(request: Request) -> Response:
                 )
 
             else:
-                # --- Non-streaming path ---
-                upstream_data = await _forward_to_upstream(upstream_body, upstream_url)
+                # --- OpenAI non-streaming path ---
+                upstream_data = await _forward_to_upstream(upstream_body, effective_url)
 
                 # --- 5. Scan the upstream response ---
                 upstream_data, response_meta = _scan_upstream_response(upstream_data)
@@ -740,7 +877,7 @@ async def proxy_chat_completions(request: Request) -> Response:
                     request_id=request_id,
                     redactions=redaction_count,
                     blocked=False,
-                    detail=f"Forwarded to upstream: {upstream_url}",
+                    detail=f"Forwarded to upstream: {effective_url}",
                     redaction_summary=redaction_summary or None,
                     threats=threats_for_audit if threats_for_audit else None,
                     response=response_meta,
@@ -838,3 +975,60 @@ async def get_audit_log(
     """
     assert _db is not None, "AuditDB not initialised"
     return await asyncio.to_thread(_db.get_all, limit=limit, offset=offset, blocked=blocked)
+
+
+@app.get("/v1/audit/export", dependencies=[Depends(_verify_api_key)])
+async def export_audit_log(
+    format: str = "ndjson",
+    limit: int | None = None,
+    offset: int = 0,
+    blocked: bool | None = None,
+) -> Response:
+    """Bulk-export audit events as NDJSON (default) or CSV.
+
+    Query params:
+      format  — "ndjson" (default) or "csv"
+      limit   — max rows to return
+      offset  — rows to skip
+      blocked — true/false to filter by blocked status
+
+    Nested JSON fields (redaction_summary, threats, response) are serialised
+    as JSON strings in CSV output.
+    """
+    assert _db is not None, "AuditDB not initialised"
+    events: list[dict[str, Any]] = await asyncio.to_thread(
+        _db.get_all, limit=limit, offset=offset, blocked=blocked
+    )
+
+    if format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "id", "request_id", "timestamp", "redactions", "blocked",
+            "detail", "redaction_summary", "threats", "response",
+        ])
+        for event in events:
+            writer.writerow([
+                event.get("id", ""),
+                event.get("request_id", ""),
+                event.get("timestamp", ""),
+                event.get("redactions", 0),
+                event.get("blocked", False),
+                event.get("detail", ""),
+                json.dumps(event["redaction_summary"]) if event.get("redaction_summary") else "",
+                json.dumps(event["threats"]) if event.get("threats") else "",
+                json.dumps(event["response"]) if event.get("response") else "",
+            ])
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="audit_export.csv"'},
+        )
+
+    # NDJSON — one JSON object per line
+    ndjson = "\n".join(json.dumps(event) for event in events)
+    return Response(
+        content=ndjson,
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": 'attachment; filename="audit_export.ndjson"'},
+    )

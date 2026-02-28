@@ -3,14 +3,20 @@ Sentinel-Shield — Prompt Guard (Phase 3)
 
 Detects jailbreak attempts and prompt-injection attacks in sanitised messages.
 Runs after redaction on already-cleaned text (PII/secrets are already removed).
-Uses stdlib only (re, dataclasses).
+Uses stdlib only (re, json, dataclasses).
+
+Custom rules can be loaded from a JSON file at startup; see PromptGuard.__init__.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Literal
+
+logger = logging.getLogger("sentinel-shield.guard")
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +39,7 @@ class GuardResult:
 
 
 # ---------------------------------------------------------------------------
-# Rule table — compiled once at import time
+# Built-in rule table — compiled once at import time
 # ---------------------------------------------------------------------------
 # Each entry: (category, rule_name, compiled_pattern, severity)
 
@@ -125,6 +131,51 @@ _RULES: list[tuple[str, str, re.Pattern, str]] = [
 
 
 # ---------------------------------------------------------------------------
+# Custom rules loader
+# ---------------------------------------------------------------------------
+
+def _load_rules_from_file(path: str) -> list[tuple[str, str, re.Pattern, str]]:
+    """Load additional guard rules from a JSON file.
+
+    Expected format::
+
+        {
+          "rules": [
+            {
+              "category": "CUSTOM",
+              "rule_name": "my_rule",
+              "pattern": "\\\\bsecret_word\\\\b",
+              "flags": ["IGNORECASE"],
+              "severity": "HIGH"
+            }
+          ]
+        }
+
+    ``flags`` is optional; valid values are any ``re`` flag names
+    (e.g. ``"IGNORECASE"``, ``"MULTILINE"``).
+
+    Raises ``ValueError`` if any rule is missing required fields.
+    """
+    with open(path) as fh:
+        data = json.load(fh)
+
+    rules: list[tuple[str, str, re.Pattern, str]] = []
+    for i, rule in enumerate(data.get("rules", [])):
+        for required in ("category", "rule_name", "pattern", "severity"):
+            if required not in rule:
+                raise ValueError(f"Rule #{i} in {path!r} is missing required field {required!r}")
+
+        flag_value = 0
+        for flag_name in rule.get("flags", []):
+            flag_value |= getattr(re, flag_name, 0)
+
+        compiled = re.compile(rule["pattern"], flag_value)
+        rules.append((rule["category"], rule["rule_name"], compiled, rule["severity"]))
+
+    return rules
+
+
+# ---------------------------------------------------------------------------
 # Blocking policy
 # ---------------------------------------------------------------------------
 
@@ -153,13 +204,39 @@ def _blocking_policy(threats: list[Threat]) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 class PromptGuard:
-    """Inspect text (or message lists) for jailbreak / prompt-injection patterns."""
+    """Inspect text (or message lists) for jailbreak / prompt-injection patterns.
+
+    Args:
+        rules_file: Optional path to a JSON file with additional rules.
+                    Custom rules are appended after the built-in rules so the
+                    blocking policy applies uniformly across all of them.
+    """
+
+    def __init__(self, rules_file: str | None = None) -> None:
+        self._rules: list[tuple[str, str, re.Pattern, str]] = list(_RULES)
+
+        if rules_file:
+            try:
+                extra = _load_rules_from_file(rules_file)
+                self._rules.extend(extra)
+                logger.info(
+                    "Loaded %d custom guard rule(s) from %s (total: %d)",
+                    len(extra),
+                    rules_file,
+                    len(self._rules),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to load custom guard rules from %s — using built-ins only: %s",
+                    rules_file,
+                    exc,
+                )
 
     def inspect(self, text: str) -> GuardResult:
         """Run all rules against *text* and apply blocking policy."""
         threats: list[Threat] = []
 
-        for category, rule_name, pattern, severity in _RULES:
+        for category, rule_name, pattern, severity in self._rules:
             match = pattern.search(text)
             if match:
                 threats.append(
