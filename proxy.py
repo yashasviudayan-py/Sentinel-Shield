@@ -1,5 +1,5 @@
 """
-Sentinel-Shield — AI Security Proxy (v0.9.0)
+Sentinel-Shield — AI Security Proxy (v1.0.0)
 
 Pipeline per request:
   Parse → [413 if too large] → Redact → Guard → [403 if blocked]
@@ -91,6 +91,11 @@ _upstream_errors_total = Counter(
     "sentinel_upstream_errors_total",
     "Total upstream LLM errors",
 )
+_tokens_total = Counter(
+    "sentinel_tokens_total",
+    "Total LLM tokens processed, by type",
+    ["token_type"],  # prompt | completion
+)
 
 # ---------------------------------------------------------------------------
 # Request size limit
@@ -141,7 +146,7 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Sentinel-Shield",
-    version="0.9.0",
+    version="1.0.0",
     description="AI Security Proxy — redact, guard, rate-limit, and forward LLM traffic.",
     lifespan=lifespan,
 )
@@ -187,6 +192,7 @@ async def record_audit_event(
     redaction_summary: dict[str, int] | None = None,
     threats: list[dict] | None = None,
     response: dict[str, Any] | None = None,
+    token_usage: dict[str, Any] | None = None,
 ) -> None:
     entry: dict[str, Any] = {
         "request_id": request_id,
@@ -201,6 +207,8 @@ async def record_audit_event(
         entry["threats"] = threats
     if response is not None:
         entry["response"] = response
+    if token_usage is not None:
+        entry["token_usage"] = token_usage
 
     assert _db is not None, "AuditDB not initialised"
     await asyncio.to_thread(_db.insert, entry)
@@ -224,6 +232,37 @@ def _serialise_threats(threats: list[Threat], *, include_matched_text: bool) -> 
             item["matched_text"] = t.matched_text
         result.append(item)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Token usage helpers
+# ---------------------------------------------------------------------------
+
+def _extract_usage(data: dict[str, Any], model: str = "") -> dict[str, Any] | None:
+    """Extract token usage from an OpenAI-format response dict.
+
+    Returns a dict with prompt_tokens, completion_tokens, total_tokens, and
+    the model name, or None if no usage info is present.
+    """
+    usage = data.get("usage")
+    if not usage:
+        return None
+    pt = usage.get("prompt_tokens", 0)
+    ct = usage.get("completion_tokens", 0)
+    return {
+        "model": model or data.get("model", "unknown"),
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "total_tokens": usage.get("total_tokens", pt + ct),
+    }
+
+
+def _record_token_metrics(usage: dict[str, Any] | None) -> None:
+    """Increment Prometheus token counters from a usage dict."""
+    if not usage:
+        return
+    _tokens_total.labels(token_type="prompt").inc(usage.get("prompt_tokens", 0))
+    _tokens_total.labels(token_type="completion").inc(usage.get("completion_tokens", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +654,7 @@ async def health() -> JSONResponse:
         content={
             "status": overall,
             "service": "sentinel-shield",
-            "version": "0.9.0",
+            "version": "1.0.0",
             "checks": {
                 "database": db_status,
                 "ner_model": ner_status,
@@ -786,6 +825,11 @@ async def proxy_chat_completions(request: Request) -> Response:
                 upstream_data, response_meta = _scan_upstream_response(upstream_data)
                 sentinel_meta["response"] = response_meta
 
+                token_usage = _extract_usage(upstream_data, model=upstream_data.get("model", ""))
+                if token_usage:
+                    sentinel_meta["usage"] = token_usage
+                    _record_token_metrics(token_usage)
+
                 if response_meta.get("blocked"):
                     _schedule_webhook({
                         "event": "response_blocked",
@@ -803,6 +847,7 @@ async def proxy_chat_completions(request: Request) -> Response:
                     redaction_summary=redaction_summary or None,
                     threats=threats_for_audit if threats_for_audit else None,
                     response=response_meta,
+                    token_usage=token_usage,
                 )
                 _requests_total.labels(blocked="false", streamed=str(is_streaming).lower()).inc()
                 _request_duration.observe(time.monotonic() - t_start)
@@ -862,6 +907,11 @@ async def proxy_chat_completions(request: Request) -> Response:
                 upstream_data, response_meta = _scan_upstream_response(upstream_data)
                 sentinel_meta["response"] = response_meta
 
+                token_usage = _extract_usage(upstream_data, model=upstream_data.get("model", ""))
+                if token_usage:
+                    sentinel_meta["usage"] = token_usage
+                    _record_token_metrics(token_usage)
+
                 if response_meta.get("blocked"):
                     _schedule_webhook({
                         "event": "response_blocked",
@@ -881,6 +931,7 @@ async def proxy_chat_completions(request: Request) -> Response:
                     redaction_summary=redaction_summary or None,
                     threats=threats_for_audit if threats_for_audit else None,
                     response=response_meta,
+                    token_usage=token_usage,
                 )
                 _requests_total.labels(blocked="false", streamed="false").inc()
                 _request_duration.observe(time.monotonic() - t_start)
@@ -1032,3 +1083,16 @@ async def export_audit_log(
         media_type="application/x-ndjson",
         headers={"Content-Disposition": 'attachment; filename="audit_export.ndjson"'},
     )
+
+
+@app.get("/v1/usage", dependencies=[Depends(_verify_api_key)])
+async def get_usage_summary() -> dict[str, Any]:
+    """Return aggregated token usage across all audit events.
+
+    Response fields:
+      totals              — sum of prompt/completion/total tokens across all requests
+      by_model            — per-model breakdown with the same counts
+      requests_with_usage — number of audit events that carry usage data
+    """
+    assert _db is not None, "AuditDB not initialised"
+    return await asyncio.to_thread(_db.get_usage_summary)

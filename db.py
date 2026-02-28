@@ -33,19 +33,23 @@ CREATE TABLE IF NOT EXISTS audit_events (
     detail            TEXT    NOT NULL DEFAULT '',
     redaction_summary TEXT,
     threats           TEXT,
-    response          TEXT
+    response          TEXT,
+    token_usage       TEXT
 );
 """
 
 _INSERT = """
 INSERT INTO audit_events
-    (request_id, timestamp, redactions, blocked, detail, redaction_summary, threats, response)
+    (request_id, timestamp, redactions, blocked, detail, redaction_summary, threats, response,
+     token_usage)
 VALUES
-    (:request_id, :timestamp, :redactions, :blocked, :detail, :redaction_summary, :threats, :response);
+    (:request_id, :timestamp, :redactions, :blocked, :detail, :redaction_summary, :threats,
+     :response, :token_usage);
 """
 
 _SELECT_BASE = """
-SELECT id, request_id, timestamp, redactions, blocked, detail, redaction_summary, threats, response
+SELECT id, request_id, timestamp, redactions, blocked, detail, redaction_summary, threats,
+       response, token_usage
 FROM   audit_events
 """
 
@@ -75,7 +79,7 @@ class AuditDB:
 
     def _migrate(self) -> None:
         """Apply additive schema migrations for existing databases."""
-        for col, definition in [("response", "TEXT")]:
+        for col, definition in [("response", "TEXT"), ("token_usage", "TEXT")]:
             try:
                 self._conn.execute(f"ALTER TABLE audit_events ADD COLUMN {col} {definition};")
                 self._conn.commit()
@@ -108,6 +112,11 @@ class AuditDB:
             "response": (
                 json.dumps(entry["response"])
                 if entry.get("response")
+                else None
+            ),
+            "token_usage": (
+                json.dumps(entry["token_usage"])
+                if entry.get("token_usage")
                 else None
             ),
         }
@@ -171,8 +180,53 @@ class AuditDB:
                 event["threats"] = json.loads(row["threats"])
             if row["response"]:
                 event["response"] = json.loads(row["response"])
+            if row["token_usage"]:
+                event["token_usage"] = json.loads(row["token_usage"])
             result.append(event)
         return result
+
+    def get_usage_summary(self) -> dict[str, Any]:
+        """Return aggregated token usage across all audit events.
+
+        Returns a dict with:
+          - totals: combined prompt/completion/total token counts
+          - by_model: per-model breakdown
+          - requests_with_usage: number of events that have usage data
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT token_usage FROM audit_events WHERE token_usage IS NOT NULL"
+            ).fetchall()
+
+        totals: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        by_model: dict[str, dict[str, int]] = {}
+
+        for row in rows:
+            usage = json.loads(row[0])
+            model = usage.get("model", "unknown")
+            pt = usage.get("prompt_tokens", 0)
+            ct = usage.get("completion_tokens", 0)
+            tt = usage.get("total_tokens", 0)
+
+            totals["prompt_tokens"] += pt
+            totals["completion_tokens"] += ct
+            totals["total_tokens"] += tt
+
+            if model not in by_model:
+                by_model[model] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            by_model[model]["prompt_tokens"] += pt
+            by_model[model]["completion_tokens"] += ct
+            by_model[model]["total_tokens"] += tt
+
+        return {
+            "totals": totals,
+            "by_model": by_model,
+            "requests_with_usage": len(rows),
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -678,7 +678,7 @@ def test_health_includes_checks(client):
 
 def test_health_includes_version(client):
     resp = client.get("/health")
-    assert resp.json()["version"] == "0.9.0"
+    assert resp.json()["version"] == "1.0.0"
 
 
 def test_health_database_ok(client):
@@ -1033,3 +1033,134 @@ def test_anthropic_provider_upstream_error_returns_502(client, monkeypatch):
             "messages": [{"role": "user", "content": "Hello"}],
         })
     assert resp.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# Token usage tracking (v1.0.0)
+# ---------------------------------------------------------------------------
+
+def test_usage_in_sentinel_meta_openai(client, monkeypatch):
+    """Token usage from an OpenAI-format upstream appears in _sentinel.usage."""
+    monkeypatch.setenv("SENTINEL_UPSTREAM_URL", "http://localhost:11434/v1")
+    fake = _fake_upstream("Hello!")  # already carries usage: {5, 10, 15}
+    with patch("proxy._forward_to_upstream", new=AsyncMock(return_value=fake)):
+        resp = client.post("/v1/chat/completions", json={
+            "model": "llama3",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+    assert resp.status_code == 200
+    sentinel = resp.json()["_sentinel"]
+    assert "usage" in sentinel
+    usage = sentinel["usage"]
+    assert usage["prompt_tokens"] == 5
+    assert usage["completion_tokens"] == 10
+    assert usage["total_tokens"] == 15
+    assert usage["model"] == "llama3"
+
+
+def test_usage_in_sentinel_meta_anthropic(client, monkeypatch):
+    """Token usage from an Anthropic response appears in _sentinel.usage."""
+    monkeypatch.setenv("SENTINEL_UPSTREAM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with patch("proxy._forward_to_anthropic", new=AsyncMock(
+        return_value=_fake_anthropic_response("Hi!")
+    )):
+        resp = client.post("/v1/chat/completions", json={
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+    assert resp.status_code == 200
+    sentinel = resp.json()["_sentinel"]
+    assert "usage" in sentinel
+    usage = sentinel["usage"]
+    assert usage["prompt_tokens"] == 8
+    assert usage["completion_tokens"] == 12
+    assert usage["total_tokens"] == 20
+
+
+def test_usage_absent_when_no_upstream(client):
+    """Simulated responses (no upstream) do not include a usage key."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hello"}],
+    })
+    assert resp.status_code == 200
+    sentinel = resp.json()["_sentinel"]
+    # No upstream → no real usage data to report
+    assert "usage" not in sentinel
+
+
+def test_usage_stored_in_audit_log(client, monkeypatch):
+    """Token usage is persisted in the audit DB and returned by /v1/audit."""
+    monkeypatch.setenv("SENTINEL_UPSTREAM_URL", "http://localhost:11434/v1")
+    fake = _fake_upstream("OK")
+    with patch("proxy._forward_to_upstream", new=AsyncMock(return_value=fake)):
+        client.post("/v1/chat/completions", json={
+            "model": "llama3",
+            "messages": [{"role": "user", "content": "Test"}],
+        })
+    audit = client.get("/v1/audit").json()
+    assert audit, "Expected at least one audit event"
+    event = audit[-1]
+    assert "token_usage" in event
+    assert event["token_usage"]["prompt_tokens"] == 5
+    assert event["token_usage"]["total_tokens"] == 15
+
+
+def test_usage_endpoint_returns_totals(client, monkeypatch):
+    """/v1/usage aggregates token counts across requests."""
+    monkeypatch.setenv("SENTINEL_UPSTREAM_URL", "http://localhost:11434/v1")
+    fake = _fake_upstream("OK")
+    with patch("proxy._forward_to_upstream", new=AsyncMock(return_value=fake)):
+        for _ in range(3):
+            client.post("/v1/chat/completions", json={
+                "model": "llama3",
+                "messages": [{"role": "user", "content": "Hi"}],
+            })
+    resp = client.get("/v1/usage")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "totals" in data
+    assert "by_model" in data
+    assert "requests_with_usage" in data
+    assert data["totals"]["prompt_tokens"] == 15      # 3 × 5
+    assert data["totals"]["completion_tokens"] == 30  # 3 × 10
+    assert data["totals"]["total_tokens"] == 45       # 3 × 15
+    assert data["requests_with_usage"] == 3
+    assert "llama3" in data["by_model"]
+
+
+def test_usage_endpoint_empty_db(client):
+    """/v1/usage returns zero totals when no requests have been tracked."""
+    resp = client.get("/v1/usage")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["totals"]["total_tokens"] == 0
+    assert data["by_model"] == {}
+    assert data["requests_with_usage"] == 0
+
+
+def test_usage_endpoint_protected_by_auth(monkeypatch):
+    """When SENTINEL_API_KEY is set, /v1/usage requires a valid token."""
+    monkeypatch.setenv("SENTINEL_API_KEY", "secret-key")
+    with TestClient(app) as c:
+        resp = c.get("/v1/usage")
+        assert resp.status_code == 401
+        resp = c.get("/v1/usage", headers={"Authorization": "Bearer secret-key"})
+        assert resp.status_code == 200
+
+
+def test_prometheus_token_counters_incremented(client, monkeypatch):
+    """Prometheus sentinel_tokens_total counter increments after a forwarded request."""
+    monkeypatch.setenv("SENTINEL_UPSTREAM_URL", "http://localhost:11434/v1")
+    fake = _fake_upstream("Hello!")
+    with patch("proxy._forward_to_upstream", new=AsyncMock(return_value=fake)):
+        client.post("/v1/chat/completions", json={
+            "model": "llama3",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+    metrics_resp = client.get("/metrics")
+    assert metrics_resp.status_code == 200
+    text = metrics_resp.text
+    assert 'sentinel_tokens_total{token_type="prompt"}' in text
+    assert 'sentinel_tokens_total{token_type="completion"}' in text
